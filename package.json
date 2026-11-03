@@ -1,0 +1,12 @@
+{
+  "name": "clinifacil-mongodb",
+  "version": "1.0.0",
+  "description": "CliniFácil: CRM para clinicas com agente de IA (trabalho de NoSQL com MongoDB)",
+  "type": "module",
+  "scripts": {
+    "setup": "node --env-file=.env src/setup.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.10.0"
+  }
+}
