@@ -30,6 +30,10 @@ const regras = {
     required: ['clinicId', 'patientId', 'status', 'messages'],
     properties: { status: { enum: ['ai', 'handed_off', 'closed'] } },
   },
+  users: {
+    required: ['clinicId', 'name', 'email', 'role', 'passwordHash'],
+    properties: { role: { enum: ['admin', 'dentista', 'recepcao'] } },
+  },
 };
 
 for (const [nome, regra] of Object.entries(regras)) {
@@ -43,6 +47,7 @@ for (const [nome, regra] of Object.entries(regras)) {
 await db.collection('clinics').createIndex({ cnpj: 1 }, { unique: true });
 await db.collection('patients').createIndex({ clinicId: 1, phone: 1 }, { unique: true });
 await db.collection('appointments').createIndex({ clinicId: 1, startAt: 1 });
+await db.collection('users').createIndex({ email: 1 }, { unique: true });
 
 // ---------- 2) Documentos de exemplo ----------
 const clinicId = new ObjectId();

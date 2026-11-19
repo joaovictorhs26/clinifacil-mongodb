@@ -17,7 +17,7 @@ Trabalho de NoSQL (MongoDB). Atividade A1: descricao do sistema + codigo que cri
 
 ## 2. Banco de dados
 
-Banco `clinifacil`, com 5 colecoes:
+Banco `clinifacil`, com 6 colecoes:
 
 | Colecao | O que guarda |
 |---|---|
@@ -26,6 +26,7 @@ Banco `clinifacil`, com 5 colecoes:
 | `patients` | Pacientes que conversam com a clinica pelo WhatsApp |
 | `appointments` | Agendamentos: paciente, profissional, procedimento, horario e status |
 | `conversations` | Conversas do WhatsApp, com todas as mensagens dentro do documento |
+| `users` | Usuarios do sistema (recepcao, dentista, admin) com e-mail e senha em hash (usada no login da A3) |
 
 **Por que MongoDB aqui:** o endereco, os horarios de atendimento e as mensagens da conversa ficam **dentro** do documento e sao lidos em uma unica consulta, sem JOIN. O esquema e flexivel, e as regras (`$jsonSchema`) garantem os campos obrigatorios e os valores validos (por exemplo, o status do agendamento).
 
@@ -42,7 +43,38 @@ npm install
 Copie `.env.example` para `.env`, cole a connection string do Atlas em `MONGODB_URI` e rode:
 
 ```bash
-npm run setup
+npm run setup   # cria banco, colecoes, indices e documentos de exemplo (src/setup.js)
+npm run seed    # gera dados extras: pacientes, agendamentos, conversas, usuarios (src/seed-extra.js)
 ```
 
-O script `src/setup.js` cria o banco, as colecoes com validacao, os indices e os documentos de exemplo.
+## 4. A2: duas funcionalidades com aggregation pipelines
+
+```bash
+npm run pipelines
+```
+
+Arquivo `src/pipelines.js`. As duas pipelines resolvem problemas diferentes e usam estagios diferentes:
+
+| Funcionalidade | O que responde | Estagios |
+|---|---|---|
+| **Desempenho por profissional** | Faturamento, ticket medio e taxa de faltas de cada profissional nos ultimos 90 dias | `$match`, `$group` com `$cond`, `$lookup`, `$unwind`, `$project`, `$sort` |
+| **Painel do agente de IA** | Quantas conversas por status, horarios de pico, tamanho das conversas e % resolvida sem humano | `$project` com `$filter`, `$facet` (4 sub-pipelines), `$group`, `$bucket`, `$hour` |
+
+## 5. A3: Redis para cache de login e estatisticas de uso
+
+Precisa de um Redis **com os modulos de probabilisticos** (Redis Cloud gratuito ou Redis Stack). Coloque a URL em `REDIS_URL` no `.env`.
+
+```bash
+npm run redis-demo
+```
+
+Arquivos `src/redis-cache.js` (a logica) e `src/redis-demo.js` (simulacao).
+
+| Estrutura | Comandos | Uso no CliniFacil |
+|---|---|---|
+| **Bloom Filter** | `BF.RESERVE`, `BF.MADD`, `BF.EXISTS` | Antes de olhar o cache ou o MongoDB, pergunta "esse e-mail existe?". Se o Bloom diz que nao, o login e recusado na hora, o que protege o banco de tentativas com e-mails inventados |
+| **HyperLogLog** | `PFADD`, `PFCOUNT` | Conta usuarios **unicos** ativos por clinica por dia, gastando cerca de 12 KB sem guardar a lista de usuarios |
+| **Count-Min Sketch** | `CMS.INITBYDIM`, `CMS.INCRBY`, `CMS.QUERY` | Conta quantas vezes cada funcionalidade foi usada (login, agendar, remarcar, relatorio) em memoria fixa |
+| Cache comum | `HSET` + `EXPIRE` | Guarda os dados do usuario por 5 minutos para os proximos logins nao irem ao MongoDB |
+
+**Fluxo do login:** Bloom Filter, depois cache (hash com TTL), depois MongoDB se faltar, e entao confere a senha e cria a sessao (`SET ... EX 3600`). O Bloom pode errar para mais (falso positivo, 1% configurado), e nesse caso o MongoDB desfaz a duvida. Ele nunca erra para menos.

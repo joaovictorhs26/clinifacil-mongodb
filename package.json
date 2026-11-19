@@ -4,9 +4,13 @@
   "description": "CliniFácil: CRM para clinicas com agente de IA (trabalho de NoSQL com MongoDB)",
   "type": "module",
   "scripts": {
-    "setup": "node --env-file=.env src/setup.js"
+    "setup": "node --env-file=.env src/setup.js",
+    "seed": "node --env-file=.env src/seed-extra.js",
+    "pipelines": "node --env-file=.env src/pipelines.js",
+    "redis-demo": "node --env-file=.env src/redis-demo.js"
   },
   "dependencies": {
-    "mongodb": "^6.10.0"
+    "mongodb": "^6.10.0",
+    "redis": "^6.3.1"
   }
 }
