@@ -1,25 +1,22 @@
 // A3: Redis como cache de login e estatisticas de uso, com estruturas probabilisticas.
 //
-//  Estrutura            Comando Redis         Para que serve aqui
-//  -------------------  --------------------  ------------------------------------------------
-//  Bloom Filter (BF)    BF.ADD / BF.EXISTS    "esse e-mail existe?" sem ir ao MongoDB
-//  HyperLogLog (HLL)    PFADD / PFCOUNT       usuarios UNICOS ativos por dia (12 KB fixos)
-//  Count-Min Sketch     CMS.INCRBY / CMS.QUERY  quantas vezes cada funcionalidade foi usada
-//  (cache comum)        HSET + EXPIRE         dados do usuario guardados por 5 min (TTL)
+//  Estrutura          Comandos                 Para que serve aqui
+//  -----------------  -----------------------  ---------------------------------------------
+//  Bloom Filter       BF.ADD / BF.EXISTS       "esse e-mail existe?" sem ir ao MongoDB
+//  HyperLogLog        PFADD / PFCOUNT          conta usuarios UNICOS ativos no dia
+//  Count-Min Sketch   CMS.INCRBY / CMS.QUERY   conta quantas vezes cada funcionalidade foi usada
+//  Cache comum        HSET + EXPIRE            guarda o usuario por 5 min (depois some sozinho)
 //
 // Precisa de Redis com os modulos de probabilisticos (Redis Stack / Redis Cloud).
 import { createClient } from 'redis';
-import { scrypt, randomBytes, timingSafeEqual } from 'node:crypto';
-import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 
-const scryptAsync = promisify(scrypt);
-
-const TTL_CACHE_USUARIO = 300; // 5 minutos
-const TTL_SESSAO = 3600;       // 1 hora
 const BF_KEY = 'bf:emails';
 const CMS_KEY = 'cms:uso';
+const TTL_CACHE = 300; // 5 minutos, em segundos
 
-const hoje = () => new Date().toISOString().slice(0, 10); // 2026-11-19
+const hash = (senha) => createHash('sha256').update(senha).digest('hex');
+const hoje = () => new Date().toISOString().slice(0, 10); // ex.: 2026-11-24
 
 export async function conectarRedis(url = process.env.REDIS_URL) {
   if (!url) throw new Error('Defina REDIS_URL no arquivo .env');
@@ -29,104 +26,80 @@ export async function conectarRedis(url = process.env.REDIS_URL) {
   return redis;
 }
 
-// Cria as estruturas se ainda nao existirem (erro "item exists" e ignorado)
+// Cria o Bloom e o Count-Min Sketch (se ja existem, o Redis avisa e a gente ignora o aviso)
 export async function prepararEstruturas(redis) {
-  // Bloom: 10.000 e-mails com 1% de falsos positivos
-  await redis.sendCommand(['BF.RESERVE', BF_KEY, '0.01', '10000']).catch(ignorarSeExiste);
-  // Count-Min Sketch: largura 2000 x profundidade 5
-  await redis.sendCommand(['CMS.INITBYDIM', CMS_KEY, '2000', '5']).catch(ignorarSeExiste);
-}
-function ignorarSeExiste(e) {
-  if (!/exists/i.test(e.message)) throw e;
+  const ignora = (e) => { if (!/exists/i.test(e.message)) throw e; };
+  // Bloom: 10.000 e-mails, aceitando 1% de erro
+  await redis.sendCommand(['BF.RESERVE', BF_KEY, '0.01', '10000']).catch(ignora);
+  // Count-Min Sketch: tabela de 2000 colunas x 5 linhas
+  await redis.sendCommand(['CMS.INITBYDIM', CMS_KEY, '2000', '5']).catch(ignora);
 }
 
-// Carrega todos os e-mails do MongoDB para o Bloom Filter (rodar ao iniciar o sistema)
-export async function aquecerBloom(redis, db) {
-  const emails = await db.collection('users').find({}, { projection: { email: 1 } }).toArray();
-  if (emails.length) await redis.sendCommand(['BF.MADD', BF_KEY, ...emails.map((u) => u.email)]);
-  return emails.length;
-}
-
-async function senhaConfere(senha, passwordHash) {
-  const [salt, hash] = passwordHash.split(':');
-  const calculado = await scryptAsync(senha, salt, 32);
-  return timingSafeEqual(calculado, Buffer.from(hash, 'hex'));
+// Coloca todos os e-mails do MongoDB dentro do Bloom Filter (roda ao iniciar o sistema)
+export async function carregarBloom(redis, db) {
+  const usuarios = await db.collection('users').find().toArray();
+  await redis.sendCommand(['BF.MADD', BF_KEY, ...usuarios.map((u) => u.email)]);
+  return usuarios.length;
 }
 
 // ---------------------------------------------------------------------------
-// Login com cache. Devolve { ok, motivo, origem, token }
-//   origem = 'bloom'  -> barrado pelo Bloom, MongoDB nem foi consultado
-//   origem = 'cache'  -> usuario veio do Redis
-//   origem = 'mongo'  -> foi ao MongoDB e guardou no cache
+// Login. Devolve { ok, motivo, origem }
+//   origem = 'bloom' -> e-mail nao existe, barrado sem consultar nada
+//   origem = 'cache' -> usuario veio do Redis
+//   origem = 'mongo' -> foi ao MongoDB e guardou no cache
 // ---------------------------------------------------------------------------
 export async function login(redis, db, email, senha) {
-  // 1) Bloom Filter: se diz "nao existe", e certeza. Nao gasta cache nem banco.
+  // 1) Bloom Filter: se ele diz "nao existe", tem certeza
   const existe = await redis.sendCommand(['BF.EXISTS', BF_KEY, email]);
   if (!existe) {
-    await redis.incr('stats:login:barrado_bloom');
+    await redis.incr('stats:barrado_bloom');
     return { ok: false, motivo: 'usuario inexistente', origem: 'bloom' };
   }
 
-  // 2) Cache: dados do usuario guardados em um hash com TTL
+  // 2) Cache: procura o usuario guardado no Redis
   const chave = `user:${email}`;
   let usuario = await redis.hGetAll(chave);
   let origem = 'cache';
 
   if (!usuario.passwordHash) {
-    // 3) Cache miss: busca no MongoDB e guarda no Redis
+    // 3) Nao estava no cache: busca no MongoDB e guarda no Redis por 5 minutos
     origem = 'mongo';
     const doc = await db.collection('users').findOne({ email });
-    if (!doc) {
-      // o Bloom pode errar para mais (falso positivo): o MongoDB tira a duvida
-      await redis.incr('stats:login:falso_positivo_bloom');
-      return { ok: false, motivo: 'usuario inexistente', origem };
-    }
-    usuario = { id: String(doc._id), clinicId: String(doc.clinicId), role: doc.role, passwordHash: doc.passwordHash };
+    if (!doc) return { ok: false, motivo: 'usuario inexistente', origem }; // o Bloom errou (1%)
+    usuario = { id: String(doc._id), clinicId: String(doc.clinicId), passwordHash: doc.passwordHash };
     await redis.hSet(chave, usuario);
-    await redis.expire(chave, TTL_CACHE_USUARIO);
-    await redis.incr('stats:login:cache_miss');
+    await redis.expire(chave, TTL_CACHE);
+    await redis.incr('stats:cache_miss');
   } else {
-    await redis.incr('stats:login:cache_hit');
+    await redis.incr('stats:cache_hit');
   }
 
-  if (!(await senhaConfere(senha, usuario.passwordHash))) {
-    await redis.incr('stats:login:senha_errada');
+  // 4) Confere a senha
+  if (hash(senha) !== usuario.passwordHash) {
     return { ok: false, motivo: 'senha incorreta', origem };
   }
 
-  // 4) Sucesso: cria sessao e registra as estatisticas
-  const token = randomBytes(24).toString('hex');
-  await redis.set(`sessao:${token}`, usuario.id, { EX: TTL_SESSAO });
+  // 5) Login ok: registra nas estatisticas
   await redis.pfAdd(`hll:ativos:${usuario.clinicId}:${hoje()}`, usuario.id); // HyperLogLog
   await registrarUso(redis, 'login');                                         // Count-Min Sketch
-  return { ok: true, origem, token, role: usuario.role };
+  return { ok: true, origem };
 }
 
-// Conta o uso de uma funcionalidade ("agendar", "login", "relatorio"...) no Count-Min Sketch
+// Soma 1 (ou mais) no contador de uma funcionalidade ("agendar", "login"...)
 export async function registrarUso(redis, funcionalidade, vezes = 1) {
   await redis.sendCommand(['CMS.INCRBY', CMS_KEY, funcionalidade, String(vezes)]);
 }
 
-// Estatisticas de uso do sistema
+// Le as estatisticas
 export async function estatisticas(redis, clinicId, funcionalidades) {
-  const ativosHoje = await redis.pfCount(`hll:ativos:${clinicId}:${hoje()}`);
+  const usuariosUnicosHoje = await redis.pfCount(`hll:ativos:${clinicId}:${hoje()}`);
+
   const contagens = await redis.sendCommand(['CMS.QUERY', CMS_KEY, ...funcionalidades]);
-  const uso = Object.fromEntries(funcionalidades.map((f, i) => [f, Number(contagens[i])]));
+  const usoPorFuncionalidade = Object.fromEntries(funcionalidades.map((f, i) => [f, Number(contagens[i])]));
 
-  const [hit, miss, barrado, errada, falsoPos] = (
-    await redis.mGet([
-      'stats:login:cache_hit', 'stats:login:cache_miss', 'stats:login:barrado_bloom',
-      'stats:login:senha_errada', 'stats:login:falso_positivo_bloom',
-    ])
-  ).map((v) => Number(v ?? 0));
+  const hit = Number(await redis.get('stats:cache_hit')) || 0;
+  const miss = Number(await redis.get('stats:cache_miss')) || 0;
+  const barradosPeloBloom = Number(await redis.get('stats:barrado_bloom')) || 0;
 
-  return {
-    usuariosUnicosAtivosHoje: ativosHoje,
-    usoPorFuncionalidade: uso,
-    login: {
-      cacheHit: hit, cacheMiss: miss,
-      taxaAcertoCachePct: hit + miss ? Math.round((hit / (hit + miss)) * 1000) / 10 : 0,
-      barradosPeloBloom: barrado, falsosPositivosBloom: falsoPos, senhaErrada: errada,
-    },
-  };
+  return { usuariosUnicosHoje, usoPorFuncionalidade, cacheHit: hit, cacheMiss: miss, barradosPeloBloom };
 }

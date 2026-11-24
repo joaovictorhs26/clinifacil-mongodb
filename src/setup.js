@@ -1,5 +1,8 @@
-// Cria o banco "clinifacil", as 5 colecoes (com validacao) e insere documentos de exemplo.
+// Cria o banco "clinifacil", as 4 colecoes (com validacao) e um exemplo de cada.
 // Uso: npm run setup
+//
+// AGREGACAO: os agendamentos e as conversas ficam DENTRO do paciente
+// (listas "appointments" e "conversations"), em vez de colecoes separadas.
 import { MongoClient, ObjectId } from 'mongodb';
 
 const uri = process.env.MONGODB_URI;
@@ -7,10 +10,10 @@ if (!uri) throw new Error('Defina MONGODB_URI no arquivo .env');
 
 const client = new MongoClient(uri);
 await client.connect();
-const db = client.db("clinifacil");
+const db = client.db('clinifacil');
 
 // ---------- 1) Colecoes com regras de validacao ($jsonSchema) ----------
-// Cada regra diz quais campos sao obrigatorios e quais valores sao aceitos.
+// "required" = campos obrigatorios. "enum" = so aceita esses valores.
 const regras = {
   clinics: {
     required: ['name', 'cnpj', 'status'],
@@ -21,14 +24,6 @@ const regras = {
   },
   patients: {
     required: ['clinicId', 'name', 'phone'],
-  },
-  appointments: {
-    required: ['clinicId', 'patientId', 'professionalId', 'procedure', 'startAt', 'status'],
-    properties: { status: { enum: ['scheduled', 'confirmed', 'completed', 'canceled', 'no_show'] } },
-  },
-  conversations: {
-    required: ['clinicId', 'patientId', 'status', 'messages'],
-    properties: { status: { enum: ['ai', 'handed_off', 'closed'] } },
   },
   users: {
     required: ['clinicId', 'name', 'email', 'role', 'passwordHash'],
@@ -42,24 +37,25 @@ for (const [nome, regra] of Object.entries(regras)) {
     validator: { $jsonSchema: { bsonType: 'object', ...regra } },
   });
 }
+// colecoes antigas (versao anterior do trabalho), se existirem
+await db.dropCollection('appointments').catch(() => {});
+await db.dropCollection('conversations').catch(() => {});
 
-// Indices: acelera buscas e impede duplicados
+// Indices: "unique" impede duplicados
 await db.collection('clinics').createIndex({ cnpj: 1 }, { unique: true });
 await db.collection('patients').createIndex({ clinicId: 1, phone: 1 }, { unique: true });
-await db.collection('appointments').createIndex({ clinicId: 1, startAt: 1 });
 await db.collection('users').createIndex({ email: 1 }, { unique: true });
 
 // ---------- 2) Documentos de exemplo ----------
 const clinicId = new ObjectId();
 const drAna = new ObjectId();
-const maria = new ObjectId();
 
 await db.collection('clinics').insertOne({
   _id: clinicId,
   name: 'Sorriso Pleno',
   cnpj: '12345678000190',
   specialties: ['Odontologia geral', 'Estetica dental'],
-  address: { city: 'Rio de Janeiro', state: 'RJ' }, // dentro do documento
+  address: { city: 'Rio de Janeiro', state: 'RJ' }, // objeto dentro do documento
   whatsapp: '5521999990001',
   status: 'active',
 });
@@ -72,32 +68,32 @@ await db.collection('professionals').insertOne({
   workingHours: [{ weekday: 1, start: '08:00', end: '17:00' }],
 });
 
+// O paciente ja carrega seus agendamentos e conversas dentro dele
 await db.collection('patients').insertOne({
-  _id: maria,
   clinicId,
   name: 'Maria Oliveira',
   phone: '5521988881111',
   tags: ['retorno'],
-});
 
-await db.collection('appointments').insertOne({
-  clinicId,
-  patientId: maria,
-  professionalId: drAna,
-  procedure: { name: 'Limpeza dental', durationMinutes: 40, price: 180 },
-  startAt: new Date('2026-11-10T11:00:00Z'),
-  status: 'scheduled',
-  createdBy: 'ai_agent',
-});
+  appointments: [
+    {
+      professionalId: drAna,            // referencia ao profissional
+      professionalName: 'Dra. Ana Souza', // copia do nome, para nao precisar buscar na outra colecao
+      procedure: { name: 'Limpeza dental', durationMinutes: 40, price: 180 },
+      startAt: new Date('2026-11-10T11:00:00Z'),
+      status: 'completed',
+    },
+  ],
 
-await db.collection('conversations').insertOne({
-  clinicId,
-  patientId: maria,
-  status: 'closed',
-  messages: [
-    { from: 'patient', text: 'Oi, queria marcar uma limpeza', sentAt: new Date('2026-11-05T13:00:00Z') },
-    { from: 'ai', text: 'Ola, Maria! Tenho horario dia 10/11 as 08h. Pode ser?', sentAt: new Date('2026-11-05T13:00:05Z') },
-    { from: 'patient', text: 'Pode sim!', sentAt: new Date('2026-11-05T13:01:00Z') },
+  conversations: [
+    {
+      status: 'closed',
+      messages: [
+        { from: 'patient', text: 'Oi, queria marcar uma limpeza', sentAt: new Date('2026-11-05T13:00:00Z') },
+        { from: 'ai', text: 'Ola, Maria! Tenho horario dia 10/11 as 08h. Pode ser?', sentAt: new Date('2026-11-05T13:00:05Z') },
+        { from: 'patient', text: 'Pode sim!', sentAt: new Date('2026-11-05T13:01:00Z') },
+      ],
+    },
   ],
 });
 

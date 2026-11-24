@@ -1,23 +1,16 @@
-// Gera dados extras (pacientes, agendamentos, conversas e usuarios) para as
-// pipelines (A2) e o cache Redis (A3) terem o que analisar.
+// Gera dados extras (pacientes com agendamentos e conversas dentro, e usuarios)
+// para as pipelines (A2) e o cache Redis (A3) terem o que analisar.
 // Roda depois do "npm run setup". Pode rodar varias vezes: apaga so o que ele mesmo criou (seed: true).
 // Uso: npm run seed
 import { MongoClient } from 'mongodb';
-import { scrypt, randomBytes } from 'node:crypto';
-import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 
-const scryptAsync = promisify(scrypt);
+// Senha guardada como hash SHA-256 (nunca a senha pura).
+// Obs.: em producao o ideal seria bcrypt; aqui o SHA-256 basta para a demonstracao.
+export const hashSenha = (senha) => createHash('sha256').update(senha).digest('hex');
 
-export async function hashSenha(senha) {
-  const salt = randomBytes(16).toString('hex');
-  const hash = (await scryptAsync(senha, salt, 32)).toString('hex');
-  return `${salt}:${hash}`;
-}
-
-// Gerador pseudo-aleatorio com semente fixa: os dados saem iguais a cada execucao
-let estado = 42;
-const rand = () => ((estado = (estado * 1664525 + 1013904223) % 4294967296) / 4294967296);
-const escolhe = (lista) => lista[Math.floor(rand() * lista.length)];
+const escolhe = (lista) => lista[Math.floor(Math.random() * lista.length)];
+const sorteio = (n) => Math.floor(Math.random() * n); // numero de 0 ate n-1
 
 export async function seed(db) {
   const clinic = await db.collection('clinics').findOne({ cnpj: '12345678000190' });
@@ -25,36 +18,20 @@ export async function seed(db) {
   const clinicId = clinic._id;
 
   // limpa o que este script criou antes
-  for (const nome of ['professionals', 'patients', 'appointments', 'conversations', 'users']) {
+  for (const nome of ['professionals', 'patients', 'users']) {
     await db.collection(nome).deleteMany({ seed: true });
   }
 
   // ---- profissionais ----
-  const profs = [
+  const novos = [
     { name: 'Dr. Bruno Lima', specialty: 'Ortodontia' },
     { name: 'Dra. Carla Mendes', specialty: 'Estetica dental' },
     { name: 'Dr. Diego Alves', specialty: 'Endodontia' },
   ].map((p) => ({ clinicId, ...p, workingHours: [{ weekday: 2, start: '09:00', end: '18:00' }], seed: true }));
-  const { insertedIds } = await db.collection('professionals').insertMany(profs);
-  const todosProfs = [
-    await db.collection('professionals').findOne({ clinicId, name: 'Dra. Ana Souza' }),
-    ...profs.map((p, i) => ({ ...p, _id: insertedIds[i] })),
-  ].filter(Boolean);
+  const { insertedIds } = await db.collection('professionals').insertMany(novos);
+  const profissionais = novos.map((p, i) => ({ _id: insertedIds[i], name: p.name }));
 
-  // ---- pacientes ----
-  const nomes = ['Joao', 'Maria', 'Pedro', 'Ana', 'Lucas', 'Julia', 'Rafael', 'Camila', 'Felipe', 'Beatriz',
-    'Gustavo', 'Larissa', 'Thiago', 'Fernanda', 'Rodrigo', 'Patricia', 'Marcelo', 'Aline', 'Bruno', 'Renata'];
-  const pacientes = nomes.map((n, i) => ({
-    clinicId,
-    name: `${n} ${escolhe(['Silva', 'Santos', 'Costa', 'Pereira', 'Rocha'])}`,
-    phone: `55219${String(70000000 + i * 1111).padStart(8, '0')}`,
-    tags: i % 3 === 0 ? ['retorno'] : [],
-    seed: true,
-  }));
-  const pr = await db.collection('patients').insertMany(pacientes);
-  const idsPac = Object.values(pr.insertedIds);
-
-  // ---- agendamentos (ultimos 5 meses ate hoje + alguns futuros) ----
+  // ---- pacientes (cada um ja com seus agendamentos e conversas dentro) ----
   const procedimentos = [
     { name: 'Limpeza dental', durationMinutes: 40, price: 180 },
     { name: 'Clareamento', durationMinutes: 60, price: 900 },
@@ -63,71 +40,64 @@ export async function seed(db) {
     { name: 'Restauracao', durationMinutes: 50, price: 350 },
   ];
   const hoje = new Date('2026-11-19T12:00:00Z');
-  const agend = [];
-  for (let i = 0; i < 120; i++) {
-    const dias = Math.floor(rand() * 150) - 10; // de -10 (futuro) ate 140 dias atras
-    const quando = new Date(hoje.getTime() - dias * 86400000);
-    quando.setUTCHours(11 + Math.floor(rand() * 8), 0, 0, 0);
-    let status;
-    if (dias < 0) status = 'scheduled';
-    else {
-      const x = rand();
-      status = x < 0.62 ? 'completed' : x < 0.80 ? 'no_show' : x < 0.92 ? 'canceled' : 'confirmed';
-    }
-    agend.push({
-      clinicId,
-      patientId: escolhe(idsPac),
-      professionalId: escolhe(todosProfs)._id,
-      procedure: escolhe(procedimentos),
-      startAt: quando,
-      status,
-      createdBy: rand() < 0.7 ? 'ai_agent' : 'reception',
-      seed: true,
-    });
-  }
-  await db.collection('appointments').insertMany(agend);
+  const nomes = ['Joao', 'Maria', 'Pedro', 'Ana', 'Lucas', 'Julia', 'Rafael', 'Camila', 'Felipe', 'Beatriz',
+    'Gustavo', 'Larissa', 'Thiago', 'Fernanda', 'Rodrigo', 'Patricia', 'Marcelo', 'Aline', 'Bruno', 'Renata'];
 
-  // ---- conversas do WhatsApp ----
-  const conversas = [];
-  for (let i = 0; i < 60; i++) {
-    const inicio = new Date(hoje.getTime() - Math.floor(rand() * 60) * 86400000);
-    inicio.setUTCHours(10 + Math.floor(rand() * 12), Math.floor(rand() * 60), 0, 0);
-    const nMsgs = 2 + Math.floor(rand() * 10);
-    const messages = [];
-    for (let m = 0; m < nMsgs; m++) {
-      messages.push({
-        from: m % 2 === 0 ? 'patient' : (rand() < 0.1 ? 'human' : 'ai'),
-        text: m % 2 === 0 ? 'Quanto custa uma limpeza?' : 'A limpeza custa R$ 180.',
-        sentAt: new Date(inicio.getTime() + m * 45000),
+  const pacientes = nomes.map((nome, i) => {
+    // 1 a 5 agendamentos nos ultimos 120 dias
+    const appointments = [];
+    for (let a = 0; a < 1 + sorteio(5); a++) {
+      const prof = escolhe(profissionais);
+      const quando = new Date(hoje.getTime() - sorteio(120) * 86400000);
+      appointments.push({
+        professionalId: prof._id,
+        professionalName: prof.name,
+        procedure: escolhe(procedimentos),
+        startAt: quando,
+        status: escolhe(['completed', 'completed', 'completed', 'no_show', 'canceled']),
       });
     }
-    const x = rand();
-    conversas.push({
+
+    // 1 a 3 conversas, cada uma com 2 a 9 mensagens
+    const conversations = [];
+    for (let c = 0; c < 1 + sorteio(3); c++) {
+      const inicio = new Date(hoje.getTime() - sorteio(60) * 86400000);
+      const messages = [];
+      for (let m = 0; m < 2 + sorteio(8); m++) {
+        messages.push({
+          from: m % 2 === 0 ? 'patient' : escolhe(['ai', 'ai', 'ai', 'human']),
+          text: m % 2 === 0 ? 'Quanto custa uma limpeza?' : 'A limpeza custa R$ 180.',
+          sentAt: new Date(inicio.getTime() + m * 45000),
+        });
+      }
+      conversations.push({ status: escolhe(['closed', 'closed', 'ai', 'handed_off']), messages });
+    }
+
+    return {
       clinicId,
-      patientId: escolhe(idsPac),
-      status: x < 0.7 ? 'closed' : x < 0.9 ? 'ai' : 'handed_off',
-      messages,
+      name: `${nome} ${escolhe(['Silva', 'Santos', 'Costa', 'Pereira', 'Rocha'])}`,
+      phone: `55219${String(70000000 + i * 1111).padStart(8, '0')}`,
+      tags: i % 3 === 0 ? ['retorno'] : [],
+      appointments,
+      conversations,
       seed: true,
-    });
-  }
-  await db.collection('conversations').insertMany(conversas);
+    };
+  });
+  await db.collection('patients').insertMany(pacientes);
 
   // ---- usuarios da clinica (login do sistema) ----
-  const usuarios = [];
   const papeis = ['recepcao', 'dentista', 'admin'];
-  for (let i = 0; i < 25; i++) {
-    usuarios.push({
-      clinicId,
-      name: `Usuario ${i + 1}`,
-      email: `usuario${i + 1}@sorrisopleno.com`,
-      role: papeis[i % 3],
-      passwordHash: await hashSenha('senha123'),
-      seed: true,
-    });
-  }
+  const usuarios = Array.from({ length: 25 }, (_, i) => ({
+    clinicId,
+    name: `Usuario ${i + 1}`,
+    email: `usuario${i + 1}@sorrisopleno.com`,
+    role: papeis[i % 3],
+    passwordHash: hashSenha('senha123'),
+    seed: true,
+  }));
   await db.collection('users').insertMany(usuarios);
 
-  return { professionals: profs.length, patients: pacientes.length, appointments: agend.length, conversations: conversas.length, users: usuarios.length };
+  return { professionals: novos.length, patients: pacientes.length, users: usuarios.length };
 }
 
 // Executa direto (npm run seed). Quando importado por outro arquivo, nao roda.
